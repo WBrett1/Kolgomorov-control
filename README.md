@@ -19,7 +19,7 @@ conda activate cbc
 
 ## Dataset
 
-The dataset used in this project can be downloaded from [here](https://zenodo.org/records/18115675) (3.15 GB). Unzip the downloaded file to create the directory `/datasets`.
+The dataset used in this project can be downloaded from [here](https://doi.org/10.5281/zenodo.21853176) (3.15 GB). Unzip the downloaded file to create the directory `/datasets`.
 
 ## Running the Code
 
