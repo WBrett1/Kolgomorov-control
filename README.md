@@ -2,7 +2,7 @@
 
 **Authors:** Youssef Shehata, Kevin Schuurman, Pablo Dominguez Estevez, Nguyen Anh Khoa Doan 
 
-This repository contains the official implementation of our paper "Data-driven control of extreme events in turbulent flows through latent space clustering".
+This repository contains the official implementation of our paper ["Data-driven control of extreme events in turbulent flows through latent space clustering"](https://journals.aps.org/prfluids/abstract/10.1103/jbgr-wsnn), published in _Physical Review Fluids_.
 
 ## Abstract
 
@@ -52,3 +52,23 @@ python control_optimization/control_law_evaluation.py
 
 Update the parameters at the beginning of both files in advance to try different configurations during optimization and/or evaluation.
 
+## Citation
+
+If you find this work useful, please cite our paper:
+
+```
+@article{jbgr-wsnn,
+  title = {Data-driven control of extreme events in turbulent flows through latent space clustering},
+  author = {Shehata, Youssef and Schuurman, Kevin and Est{\'e}vez, Pablo Dom{\'{\i}}nguez and Doan, Nguyen Anh Khoa},
+  journal = {Phys. Rev. Fluids},
+  volume = {11},
+  issue = {9},
+  pages = {093902},
+  numpages = {31},
+  year = {2026},
+  month = {Sep},
+  publisher = {American Physical Society},
+  doi = {10.1103/jbgr-wsnn},
+  url = {https://link.aps.org/doi/10.1103/jbgr-wsnn}
+}
+```
