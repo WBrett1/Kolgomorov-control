@@ -6,7 +6,6 @@
 # -----------------------------------------------------------------------------
 
 import itertools as it
-import string
 from typing import List, Optional, Union
 
 import einops
@@ -74,6 +73,7 @@ class KolSol(BaseTorchKolSol):
         self.kk_div = self.kk_div.to(torch.complex128)
 
         self.nabla = self.nabla.to(torch.complex128)
+        self.neg_nabla = -self.nabla  # used in every right-hand-side evaluation, so negated once here
 
     def dynamics(self, u_hat: torch.Tensor) -> torch.Tensor:
 
@@ -122,15 +122,16 @@ class KolSol(BaseTorchKolSol):
 
         # Canuto EQ [7.2.12]
         aapt = self.aap_all(u_hat) # Get rid of the unncessary loop and get the aapt directly
-        f_hat = oe.contract('...t, ut... -> ...u', -self.nabla, aapt)
+        f_hat = torch.sum(self.neg_nabla.unsqueeze(-2) * torch.movedim(aapt, (0, 1), (-2, -1)), dim=-1)
 
-        k_dot_f = oe.contract('...u, ...u -> ...', self.kt, f_hat + (1-beta)*self.f) / self.kk_div
-        k_dot_f[tuple([...]) + tuple(self.nk for _ in range(self.ndim))] = 0.0
+        f_total = f_hat + (1-beta)*self.f  # nonlinear term plus forcing, used twice below
+        k_dot_f = torch.sum(self.kt * f_total, dim=-1) / self.kk_div
+        k_dot_f[tuple([...]) + tuple(self.nk for _ in range(self.ndim))].zero_()
 
-        kk_fk = oe.contract('...u, ... -> ...u', self.kt, k_dot_f)
+        kk_fk = self.kt * k_dot_f.unsqueeze(-1)
 
         # Canuto EQ [7.2.11]
-        du_hat_dt = (f_hat + (1-beta)*self.f) - kk_fk - (1.0 / self.re) * oe.contract('...u, ... -> ...u', u_hat, self.kk)
+        du_hat_dt = f_total - kk_fk - (1.0 / self.re) * (u_hat * self.kk.unsqueeze(-1))
 
         return du_hat_dt
 
@@ -212,11 +213,7 @@ class KolSol(BaseTorchKolSol):
 
         w_hat = self.vorticity(u_hat)
 
-        # generate indices for each dimension
-        g = iter(string.ascii_letters)
-        idx = ''.join(next(g) for _ in range(self.ndim))
-
-        dissipation = oe.contract(f'...{idx} -> ...', w_hat * torch.conj(w_hat))
+        dissipation = torch.sum(w_hat * torch.conj(w_hat), dim=tuple(range(-self.ndim, 0)))
         dissipation /= (self.re * self.nk_grid ** (2 * self.ndim))
 
         return dissipation.real

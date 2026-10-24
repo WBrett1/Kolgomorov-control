@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader 
 from torch.utils.checkpoint import checkpoint
+import torch.autograd.forward_ad as fwAD
 import logging
 import numpy as np
 from tqdm import trange
@@ -70,7 +71,7 @@ def beta_from_u_hat(bk, u_hat, ext_threshold, max_beta, encoder, centroids_all, 
     u_field = torch.nn.functional.interpolate(u_field, size=output_size, mode='bicubic')
 
     if autoencoder_type == "sae":
-        z, _, _, _ = encoder.encoder(u_field)
+        z, _, _, _ = encoder.encoder(u_field, reconstruction_errors=False)  # only the latent vector is used
     else:
         z = encoder.encoder(u_field)
 
@@ -125,11 +126,26 @@ def update_u_hat(u_hat, beta):
     return u_hat
 
 
+# Mean of the selected entries, worked out on the GPU (NaN when none are selected)
+def masked_mean(values, mask):
+    return (values * mask).sum() / mask.sum()
+
+
+# The per-step means that exist (not NaN), read back from the GPU in one go
+def present(means):
+    means = torch.stack(means).double().cpu()  # one copy back from the GPU, so the .item() calls below do not wait
+    return [m for m in (v.item() for v in means) if not np.isnan(m)]  # .item(), unlike .numpy(), also works inside torch.func.jvp
+
+
 def loss_function(bk, u_hat0, encoder, centroids_all, cluster_types, centroids_not_normal, Ji, ks, dt, Topt, 
                   mean_epsilon, std_epsilon, f_num_ext_events=False,
                   scale_epsilon=1.0, scale_beta=1.0, control_int=1):
     
     u_hat = u_hat0
+
+    # checkpoint cannot carry forward-mode (dual) tangents, so forward-mode AD runs each step without it
+    forward_mode = any(fwAD.unpack_dual(v).tangent is not None for v in (bk, u_hat0))
+    run_step = (lambda fn, *args: fn(*args)) if forward_mode else checkpoint
 
     Nt = int(Topt / dt)
 
@@ -142,6 +158,8 @@ def loss_function(bk, u_hat0, encoder, centroids_all, cluster_types, centroids_n
     betas_norm = []
     betas_prec = []
     betas_ext = []
+    nan_found = torch.zeros((), dtype=torch.bool, device=device)
+    no_type_found = torch.zeros((), dtype=torch.bool, device=device)
     control_int = 1
     ext_threshold = mean_epsilon + nr_dev * std_epsilon
 
@@ -150,11 +168,11 @@ def loss_function(bk, u_hat0, encoder, centroids_all, cluster_types, centroids_n
     all_eps = []
 
     for step in trange(Nt, disable=log_to_file):
-        beta, eps, z_type = checkpoint(beta_from_u_hat, bk, u_hat, ext_threshold, max_beta, encoder, centroids_all, cluster_types, centroids_not_normal, Ji, ks, step, control_int)
+        beta, eps, z_type = run_step(beta_from_u_hat, bk, u_hat, ext_threshold, max_beta, encoder, centroids_all, cluster_types, centroids_not_normal, Ji, ks, step, control_int)
     
-        assert not torch.isnan(eps).any(), "Tensor contains NaN values"
+        nan_found |= torch.isnan(eps).any()  # checked once after the loop: an assert here made the CPU wait every step
         
-        all_eps += eps
+        all_eps.append(eps.detach())
 
         is_extreme = eps >= ext_threshold
         is_critical = eps >= critical_eps
@@ -163,39 +181,42 @@ def loss_function(bk, u_hat0, encoder, centroids_all, cluster_types, centroids_n
         eps_total += (torch.abs(((eps-mean_epsilon)/mean_epsilon)) * coeff).mean()
 
         
-        num_precursors += z_type[z_type == 1].size()[0]
+        num_precursors += (z_type == 1).sum()
 
-        num_ext_events += eps[is_extreme].size()[0]    # (i.e., identified as an extreme state)
-        num_f_ext_events += eps[eps >= mean_epsilon + 2 * std_epsilon].size()[0]    # (i.e., identified as actual extreme state)
+        num_ext_events += is_extreme.sum()    # (i.e., identified as an extreme state)
+        num_f_ext_events += (eps >= mean_epsilon + 2 * std_epsilon).sum()    # (i.e., identified as actual extreme state)
                 
 
-        beta_ext = beta[(z_type == 2) | (is_extreme)]
-        if beta_ext.size()[0] > 0:
-            betas_ext.append(beta_ext.mean().item())
+        is_ext = (z_type == 2) | (is_extreme)
+        betas_ext.append(masked_mean(beta.detach(), is_ext))
 
-        beta_prec = beta[(z_type == 1) & ~is_extreme]
-        if beta_prec.size()[0] > 0:
-            betas_prec.append(beta_prec.mean().item())
+        is_prec = (z_type == 1) & ~is_extreme
+        betas_prec.append(masked_mean(beta.detach(), is_prec))
 
-        beta_norm = beta[(z_type == 0) & ~is_extreme]
-        if beta_norm.size()[0] > 0:
-            betas_norm.append(beta_norm.mean().item())
-        
-        if beta_ext.size()[0] + beta_prec.size()[0] + beta_norm.size()[0] == 0:
-            print("Unknown type of cluster caught!", z_type, is_extreme)
+        is_norm = (z_type == 0) & ~is_extreme
+        betas_norm.append(masked_mean(beta.detach(), is_norm))
+
+        no_type_found |= (is_ext.sum() + is_prec.sum() + is_norm.sum() == 0)
 
         is_normal = (z_type == 0)
         coeff_beta = 9 * (is_normal) + 1        # 10 if normal, 1 otherwise
         beta_penalty_total += (torch.abs(beta) * coeff_beta).mean()
 
-        u_hat = checkpoint(update_u_hat, u_hat, beta)
+        u_hat = run_step(update_u_hat, u_hat, beta)
+
+    # the counts and statistics above stayed on the GPU; read them back once
+    assert not nan_found, "Tensor contains NaN values"
+    if no_type_found:
+        print("Unknown type of cluster caught!")
+    num_precursors, num_ext_events, num_f_ext_events = int(num_precursors), int(num_ext_events), int(num_f_ext_events)
+    betas_norm, betas_prec, betas_ext = present(betas_norm), present(betas_prec), present(betas_ext)
 
     eps_total = eps_total * dt
     beta_penalty_total = beta_penalty_total * dt
 
     loss = 1/Topt*((scale_epsilon * eps_total) + (scale_beta * beta_penalty_total))
     
-    all_eps = torch.tensor(all_eps)
+    all_eps = torch.cat(all_eps).cpu()  # the same values, on the CPU as before
     # TODO: remove unnecessary logging
     logging.info(f"Max Eps: {torch.max(all_eps).item()}, ExtvtsThreshold: {ext_threshold}, Mean Eps: {torch.mean(all_eps).item()}")    
 

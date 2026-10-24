@@ -14,7 +14,7 @@ class DiscreteSymmetries(nn.Module):
         kf = 4
 
         N = x.shape[-1]
-        k = torch.arange(-N//2, N//2)
+        k = torch.arange(-N//2, N//2, device=x.device)  # made on the GPU, so it is not copied over on every call
         kx, ky = torch.meshgrid(k, k, indexing='ij')
 
         s = a * np.pi / kf
@@ -27,7 +27,7 @@ class DiscreteSymmetries(nn.Module):
 
         if a % 2 == 1:
             ones = torch.ones_like(x_shift)
-            ones[..., 0, :, :] = -1
+            ones[..., 0, :, :].fill_(-1)  # "= -1" copied the number from the CPU on every call
             x_shift = ones* torch.flip(x_shift, (-2,)) # flip along x axis
 
         return x_shift
@@ -72,7 +72,7 @@ class STN(nn.Module):
         # dim(s) = B
 
         N = x.shape[-1]
-        k = torch.arange(-N//2, N//2)
+        k = torch.arange(-N//2, N//2, device=s.device)  # made on the GPU, so it is not copied over on every call
         kx, ky = torch.meshgrid(k, k, indexing='ij') # N x N
 
         xf = fftshift(fft2(x, dim=(-2, -1)), dim=(-2, -1))
@@ -117,7 +117,7 @@ class SymAutoencoder(nn.Module):
     def name(self):
         return 'S' + self.autoencoder.name()
 
-    def encoder(self, x):
+    def encoder(self, x, reconstruction_errors=True):
         # normal operation
         B = x.shape[0]
         input_dsym = self.discrete_symmetries(x)
@@ -142,6 +142,9 @@ class SymAutoencoder(nn.Module):
 
         encoded = torch.stack(encoded_l)
         sx = torch.stack(sx_l)
+
+        if not reconstruction_errors:  # the control scripts use only the latent vector; the errors below make the CPU wait
+            return encoded, sx, argmin_red, None
 
         reconstruct_errors = []
         for i in range(B):

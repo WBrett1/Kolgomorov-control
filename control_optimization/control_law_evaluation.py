@@ -4,6 +4,7 @@ import h5py
 import os
 import torch
 import torch.nn as nn
+import torch.autograd.forward_ad as fwAD
 import logging
 import numpy as np
 from tqdm import trange
@@ -143,11 +144,6 @@ u_hat = u_hat0.detach().clone()
 # =================================
 
 
-betas = []
-eps_vals = []
-states_type = [] 
-
-
 num_ext_events = 0
 num_precursors = 0
 
@@ -155,6 +151,8 @@ control_scale = 4
 
 control_int = 1 * control_scale     # control applied once every "control_int" timesteps (controller lag)
 response_time = 1                   # actuator response time in timesteps (actuator lag)
+progress_every = 1000               # steps between progress-bar updates; each update makes the CPU wait for the GPU
+use_cuda_graph = True               # replay a recording of each control interval (GPU only, without controller or actuator lag)
 
 
 bk = bk.to(device=device).requires_grad_(False)
@@ -180,7 +178,7 @@ def beta_from_u_hat(bk, u_hat, ext_threshold, max_beta, encoder, centroids_all, 
 
     # latent space representation
     if autoencoder_type == "sae":
-        z, _, _, _ = encoder.encoder(u_field)  
+        z, _, _, _ = encoder.encoder(u_field, reconstruction_errors=False)  # only the latent vector is used
     else:
         z = encoder.encoder(u_field)  # latent space representation
     z = z.squeeze()
@@ -215,54 +213,107 @@ ext_threshold = mean_epsilon + nr_dev * std_epsilon
 
 beta = 0
 
+
+# One RK4 step, updating u_hat in place: the last lines of the old loop, unchanged
+def rk4_step_(u_hat, beta):
+    k1 = ks.dynamics_control_betaSinVar(u_hat, beta)
+    beta1 = beta2 = beta3 = beta
+
+    u_hat_1 = u_hat + 0.5 * dt * k1
+    k2 = ks.dynamics_control_betaSinVar(u_hat_1, beta1)
+
+    u_hat_2 = u_hat + 0.5 * dt * k2
+    k3 = ks.dynamics_control_betaSinVar(u_hat_2, beta2)
+
+    u_hat_3 = u_hat + dt * k3
+    k4 = ks.dynamics_control_betaSinVar(u_hat_3, beta3)
+
+    u_hat += (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+
+
+# One control interval without controller or actuator lag: the controller, then control_scale RK4 steps
+def control_interval(u_hat, beta, step):
+    beta, eps, z_type = beta_from_u_hat(bk, u_hat, ext_threshold, max_beta, autoencoder, all_cluster_centroids, cluster_types, all_cluster_centroids, Ji, ks, step, beta, control_int=control_int)
+    for _ in range(control_scale):
+        rk4_step_(u_hat, beta)
+    return beta, eps, z_type
+
+
+# Record one control interval as a CUDA graph: replaying it re-runs the same GPU jobs without the CPU preparing each one
+def record_control_interval(u_buf):
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):  # warm-up runs on a copy (the interval updates the state in place), so the FFT plans exist
+        u_warm = u_buf.clone()
+        for _ in range(3):
+            control_interval(u_warm, 0, 0)
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outputs = control_interval(u_buf, 0, 0)  # beta is recomputed in every interval, so the 0 passed in is not used
+    return graph, outputs
+
+
+# A recording repeats the same GPU jobs every time, so lagged settings (Python logic on beta) run step by step instead,
+# as do runs where bk or the state carries a derivative (requires_grad or a forward-mode tangent), so AD is never lost
+use_graph = (use_cuda_graph and device == 'cuda' and Nt % control_scale == 0
+             and control_int == control_scale and response_time <= control_scale
+             and not any(v.requires_grad or fwAD.unpack_dual(v).tangent is not None for v in (bk, u_hat)))
+report_every = max(1, progress_every // control_scale)
+
+# One slot per control step, written on the GPU during the run and read back once after it.
+# Made once here, so a long run does not keep millions of separate small GPU tensors.
+n_measurements = (Nt + control_scale - 1) // control_scale  # Nt / control_scale, rounded up
+eps_vals = torch.empty(n_measurements, dtype=torch.float32, device=device)
+states_type = torch.empty(n_measurements, dtype=cluster_types.dtype, device=device)
+betas = torch.empty(n_measurements, dtype=bk.dtype, device=device)
+
 with torch.no_grad():
-    progress_bar = trange(Nt)
-    for step in progress_bar:
-        if step % control_scale == 0:
-            beta, eps, z_type = beta_from_u_hat(bk, u_hat, ext_threshold, max_beta, autoencoder, all_cluster_centroids, cluster_types, all_cluster_centroids, Ji, ks, step, beta, control_int=control_int)
+    if use_graph:
+        graph, (beta, eps, z_type) = record_control_interval(u_hat)
+        progress_bar = trange(Nt // control_scale, unit_scale=control_scale)
+        for i in progress_bar:
+            graph.replay()
+            eps_vals[i] = eps  # copies on the GPU into slot i: nothing waits
+            states_type[i] = z_type
+            betas[i] = beta
+            if i % report_every == 0:  # .item() makes the CPU wait for the GPU, so only now and then
+                progress_bar.set_postfix({"eps": f"{eps.item():.4f}", "beta": f"{beta.item():.4f}"})
+    else:
+        progress_bar = trange(Nt)
+        for step in progress_bar:
+            if step % control_scale == 0:
+                slot = step // control_scale
+                beta, eps, z_type = beta_from_u_hat(bk, u_hat, ext_threshold, max_beta, autoencoder, all_cluster_centroids, cluster_types, all_cluster_centroids, Ji, ks, step, beta, control_int=control_int)
 
-            eps_vals.append(eps.item())
-                            
-            if type(z_type) == int:
-                states_type.append(z_type)
-            else:
-                states_type.append(z_type.item())
+                eps_vals[slot] = eps
+                states_type[slot] = z_type
 
-            if step % control_int == 0:
-                if step == 0:
-                    new_beta = beta
+                if response_time > control_scale:  # prev_beta and new_beta only feed the actuator
+                    if step % control_int == 0:
+                        if step == 0:
+                            new_beta = beta
 
-                if not (beta == new_beta):
-                    prev_beta = new_beta
-                    new_beta = beta
+                        if not (beta == new_beta):
+                            prev_beta = new_beta
+                            new_beta = beta
 
-                if step == 0:
-                    prev_beta = torch.tensor([1e-6], device=device)
+                        if step == 0:
+                            prev_beta = torch.tensor([1e-6], device=device)
 
+                    beta, prev_beta, new_beta = actuator.get_beta(step+1, prev_beta, new_beta)
 
-            if response_time > control_scale:
-                beta, prev_beta, new_beta = actuator.get_beta(step+1, prev_beta, new_beta)
+                betas[slot] = beta
+                if step % progress_every == 0:  # .item() makes the CPU wait for the GPU, so only now and then
+                    progress_bar.set_postfix({"eps": f"{eps.item():.4f}", "beta": f"{beta.item():.4f}"})
 
-            betas.append(beta.item())
-            progress_bar.set_postfix({"eps": f"{eps.item():.4f}", "beta": f"{beta.item():.4f}"})
+            rk4_step_(u_hat, beta)
 
-            if z_type == 2: 
-                num_ext_events += 1 
-
-        k1 = ks.dynamics_control_betaSinVar(u_hat, beta)
-        beta1 = beta2 = beta3 = beta
-
-        u_hat_1 = u_hat + 0.5 * dt * k1
-        k2 = ks.dynamics_control_betaSinVar(u_hat_1, beta1)
-
-        u_hat_2 = u_hat + 0.5 * dt * k2
-        k3 = ks.dynamics_control_betaSinVar(u_hat_2, beta2)
-
-        u_hat_3 = u_hat + dt * k3
-        k4 = ks.dynamics_control_betaSinVar(u_hat_3, beta3)
-        
-        u_hat += (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
-
+# read back once, after the run, and saved as before: float64 values and default integers
+eps_vals = eps_vals.double().cpu().numpy()
+states_type = states_type.cpu().numpy().astype(int)
+betas = betas.double().cpu().numpy()
+num_ext_events = int((states_type == 2).sum())
 
 logging.info(f"Extreme Events: {num_ext_events/Nt*100} %")
 

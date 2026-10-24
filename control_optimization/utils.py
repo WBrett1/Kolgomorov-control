@@ -218,25 +218,23 @@ def identify_point_type_parallel(centroids_all, cluster_types, state_encoded_sae
     point_type = cluster_types[min_idx]
 
     # correct for extreme event false negatives 
-    point_type[dissipation >= ext_threshold] = 2
+    point_type = torch.where(dissipation >= ext_threshold, 2, point_type)
 
     return point_type
 
 
 def identify_point_type(centroids_all, cluster_types, state_encoded_sae, dissipation, ext_threshold, torch_dist=False, correct_fpee=False):
-    if dissipation >= ext_threshold:
-        return 2
-    
+    # decided on the GPU throughout: a Python "if" on dissipation, or indexing with a mask, makes the CPU wait for the GPU
     if torch_dist:
         distance_from_all_clusters = torch.linalg.norm(state_encoded_sae.repeat(centroids_all.shape[0], 1) - centroids_all, dim=1)
     
     if correct_fpee:
-        distance_from_all_clusters[cluster_types == 2] += 1e10 # arbitrary large number to avoid selecting z_type = 2
+        distance_from_all_clusters = distance_from_all_clusters + 1e10 * (cluster_types == 2) # arbitrary large number to avoid selecting z_type = 2
     
     min_idx = torch.argmin(distance_from_all_clusters)
-    point_type = cluster_types[min_idx]
+    point_type = cluster_types[min_idx.unsqueeze(0)].squeeze(0)  # indexing with a single-number tensor reads it back to the CPU
     
-    return point_type
+    return torch.where(dissipation >= ext_threshold, 2, point_type)
 
 
 def identify_point_type_notAuto(centroids_all, cluster_types, state_encoded_sae, torch_dist=False, correct_fp_ee=False, return_k_closest=False, k_closest=1):
