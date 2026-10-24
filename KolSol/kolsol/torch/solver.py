@@ -128,17 +128,8 @@ class KolSol(BaseTorchKolSol):
             Time-derivative of the velocity field in the Fourier domain.
         """
 
-        uij_aapt = []
-        for u_i in range(self.ndim):
-
-            uj_aapt = []
-            for u_j in range(self.ndim):
-                uj_aapt.append(self.aap(u_hat[..., u_j], u_hat[..., u_i]))
-
-            uij_aapt.append(torch.stack(uj_aapt, dim=0))
-
         # Canuto EQ [7.2.12]
-        aapt = torch.stack(uij_aapt, dim=0)
+        aapt = self.aap_all(u_hat) # Get rid of the unncessary loop and get the aapt directly
         f_hat = oe.contract('...t, ut... -> ...u', -self.nabla, aapt)
 
         k_dot_f = oe.contract('...u, ...u -> ...', self.kt, f_hat + (1-beta)*self.f) / self.kk_div
@@ -151,7 +142,7 @@ class KolSol(BaseTorchKolSol):
 
         return du_hat_dt
 
-    def aap(self, f1: torch.Tensor, f2: torch.Tensor) -> torch.Tensor:
+    def aap_all(self, u_hat: torch.Tensor) -> torch.Tensor:
 
         """Anti-aliased product using padding.
 
@@ -159,32 +150,28 @@ class KolSol(BaseTorchKolSol):
 
         Parameters
         ----------
-        f1: torch.Tensor
-            Array one.
-        f2: torch.Tensor
-            Array two.
+        u_hat: torch.Tensor
+            Velocity field in the Fourier domain.
 
         Returns
         -------
-        f1f2_hat: torch.Tensor
-            Anti-aliased product of the two arrays.
+        aapt: torch.Tensor          
+            Anti-aliased products of every pair of components.
         """
 
-        n_leading_dims = f1.ndim - self.ndim
-        leading_dims = f1.shape[:n_leading_dims]
+        n_leading_dims = u_hat.ndim - (self.ndim + 1)
+        leading_dims = u_hat.shape[:n_leading_dims]
 
         lb, ub = self.nk, 3 * self.nk
         scaling = (self.mk_grid / self.nk_grid) ** self.ndim
 
-        fhat = torch.stack((f1, f2), dim=-1)
-
         fhat_padded = torch.zeros(
-            size=([*leading_dims] + [self.mk_grid for _ in range(self.ndim)] + [2]),
+            size=([*leading_dims] + [self.mk_grid for _ in range(self.ndim)] + [self.ndim]),
             dtype=torch.complex128,
             device=self.device
         )
 
-        fhat_padded[tuple([...]) + tuple(slice(lb, ub) for _ in range(self.ndim)) + tuple([slice(None)])] = fhat
+        fhat_padded[tuple([...]) + tuple(slice(lb, ub) for _ in range(self.ndim)) + tuple([slice(None)])] = u_hat
 
         # define axes to work between
         axs_lb, axs_ub = n_leading_dims, self.ndim + n_leading_dims
@@ -195,16 +182,26 @@ class KolSol(BaseTorchKolSol):
             dim=tuple(range(axs_lb, axs_ub))
         )
 
-        f1f2_hat_padded = torch.fft.fftn(
-            torch.prod(f_phys, dim=-1),
-            s=f_phys.shape[slice(axs_lb, axs_ub)],
-            dim=tuple(range(axs_lb, axs_ub))
-        )
 
-        f1f2_hat_padded = scaling * torch.fft.fftshift(f1f2_hat_padded, dim=tuple(range(axs_lb, axs_ub)))
-        f1f2_hat = f1f2_hat_padded[tuple([...]) + tuple(slice(lb, ub) for _ in range(self.ndim))]
+        f1f2_hat = {}
+        for u_i, u_j in it.combinations_with_replacement(range(self.ndim), 2):
 
-        return f1f2_hat
+            f1f2_hat_padded = torch.fft.fftn(
+                f_phys[..., u_j] * f_phys[..., u_i],
+                s=f_phys.shape[slice(axs_lb, axs_ub)],
+                dim=tuple(range(axs_lb, axs_ub))
+            )
+
+            f1f2_hat_padded = scaling * torch.fft.fftshift(f1f2_hat_padded, dim=tuple(range(axs_lb, axs_ub)))
+            f1f2_hat[u_i, u_j] = f1f2_hat_padded[tuple([...]) + tuple(slice(lb, ub) for _ in range(self.ndim))]
+
+            f1f2_hat[u_j, u_i] = f1f2_hat[u_i, u_j]
+
+        uij_aapt = []
+        for u_i in range(self.ndim):
+            uij_aapt.append(torch.stack([f1f2_hat[u_i, u_j] for u_j in range(self.ndim)], dim=0))
+
+        return torch.stack(uij_aapt, dim=0)
 
     def dissip(self, u_hat: torch.Tensor) -> torch.Tensor:
 
