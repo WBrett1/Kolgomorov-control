@@ -90,17 +90,9 @@ class KolSol(BaseTorchKolSol):
             Time-derivative of the velocity field in the Fourier domain.
         """
 
-        uij_aapt = []
-        for u_i in range(self.ndim):
-
-            uj_aapt = []
-            for u_j in range(self.ndim):
-                uj_aapt.append(self.aap(u_hat[..., u_j], u_hat[..., u_i]))
-
-            uij_aapt.append(torch.stack(uj_aapt, dim=0))
-
         # Canuto EQ [7.2.12]
-        aapt = torch.stack(uij_aapt, dim=0)
+        aapt = self.aap_all(u_hat)
+
         f_hat = oe.contract('...t, ut... -> ...u', -self.nabla, aapt)
 
         k_dot_f = oe.contract('...u, ...u -> ...', self.kt, f_hat + self.f) / self.kk_div
@@ -269,17 +261,8 @@ class KolSol(BaseTorchKolSol):
         """
 
         # Canuto EQ [7.2.12]
-        uij_aapt = []
-        for u_i in range(self.ndim):
+        aapt = self.aap_all(u_hat)
 
-            uj_aapt = []
-            for u_j in range(self.ndim):
-                uj_aapt.append(self.aap(u_hat[..., u_j], u_hat[..., u_i]))
-
-            uij_aapt.append(torch.stack(uj_aapt, dim=0))
-
-        # Canuto EQ [7.2.12]
-        aapt = torch.stack(uij_aapt, dim=0)
         f_hat = oe.contract('...t, ut... -> ...u', -self.nabla, aapt)
 
         p_hat = oe.contract('...u, ...u -> ...', -self.nabla, f_hat + self.f) / self.kk_div
